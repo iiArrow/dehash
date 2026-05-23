@@ -67,16 +67,31 @@ func main() {
 
 	applyPragmas(sqlDB)
 
-	// ── Phase 1: preload package map into RAM ─────────────────────────────────
-	// There are far fewer packages than METADATA rows, so this is cheap.
-	// Avoids executing a multi-table JOIN for every single METADATA row.
-	log.Println("Phase 1: loading package details into memory...")
-	start := time.Now()
-	pkgMap, err := loadPackageMap(sqlDB)
-	if err != nil {
-		log.Fatalf("load package map: %v", err)
+	// ── detect schema variant ─────────────────────────────────────────────────
+	// The NSRL ships in two flavours:
+	//   • modern / modern-delta  — full relational schema (PACKAGE_OBJECT, APPLICATION, …)
+	//   • minimal / minimal-delta — hashes + file info only, no package metadata tables
+	fullSchema := tableExists(sqlDB, "PACKAGE_OBJECT")
+	if fullSchema {
+		log.Println("Schema: full (modern) — package details will be included")
+	} else {
+		log.Println("Schema: minimal — hash + file info only (no app/manufacturer/OS data)")
 	}
-	log.Printf("  %d packages loaded in %s", len(pkgMap), time.Since(start).Round(time.Millisecond))
+
+	// ── Phase 1: preload package map into RAM (full schema only) ──────────────
+	var pkgMap map[int64]*pkgInfo
+	start := time.Now()
+	if fullSchema {
+		log.Println("Phase 1: loading package details into memory...")
+		pkgMap, err = loadPackageMap(sqlDB)
+		if err != nil {
+			log.Fatalf("load package map: %v", err)
+		}
+		log.Printf("  %d packages loaded in %s", len(pkgMap), time.Since(start).Round(time.Millisecond))
+	} else {
+		log.Println("Phase 1: skipped (minimal schema has no package tables)")
+		pkgMap = make(map[int64]*pkgInfo)
+	}
 
 	// ── Open Pebble with write-optimised settings ─────────────────────────────
 	log.Printf("Opening Pebble: %s", *pebblePath)
@@ -96,7 +111,7 @@ func main() {
 	// Producer: single goroutine reads from SQLite
 	go func() {
 		defer close(rowCh)
-		if err := streamRows(sqlDB, rowCh); err != nil {
+		if err := streamRows(sqlDB, rowCh, fullSchema); err != nil {
 			log.Printf("stream error: %v", err)
 		}
 	}()
@@ -200,8 +215,8 @@ func loadPackageMap(db *sql.DB) (map[int64]*pkgInfo, error) {
 
 // ── Phase 2: stream METADATA rows ────────────────────────────────────────────
 
-// Simple query — no subqueries, just one JOIN on an indexed column.
-const metaQuery = `
+// Full schema: join PACKAGE_OBJECT to get package_id for detail lookup.
+const metaQueryFull = `
 SELECT
     md.sha256,
     md.sha1,
@@ -218,8 +233,29 @@ FROM METADATA md
 LEFT JOIN PACKAGE_OBJECT po ON md.object_id = po.object_id
 `
 
-func streamRows(db *sql.DB, out chan<- rawRow) error {
-	rows, err := db.Query(metaQuery)
+// Minimal schema: no PACKAGE_OBJECT — read hashes and file info only.
+const metaQueryMinimal = `
+SELECT
+    sha256,
+    sha1,
+    md5,
+    crc32,
+    CASE WHEN extension = '' OR extension IS NULL
+         THEN file_name
+         ELSE file_name || '.' || extension
+    END,
+    bytes,
+    COALESCE(path, '')
+FROM METADATA
+`
+
+func streamRows(db *sql.DB, out chan<- rawRow, fullSchema bool) error {
+	query := metaQueryFull
+	if !fullSchema {
+		query = metaQueryMinimal
+	}
+
+	rows, err := db.Query(query)
 	if err != nil {
 		return err
 	}
@@ -227,15 +263,33 @@ func streamRows(db *sql.DB, out chan<- rawRow) error {
 
 	for rows.Next() {
 		var r rawRow
-		if err := rows.Scan(
-			&r.sha256, &r.sha1, &r.md5, &r.crc32,
-			&r.fileName, &r.fileSize, &r.path, &r.packageID,
-		); err != nil {
+		var scanErr error
+		if fullSchema {
+			scanErr = rows.Scan(
+				&r.sha256, &r.sha1, &r.md5, &r.crc32,
+				&r.fileName, &r.fileSize, &r.path, &r.packageID,
+			)
+		} else {
+			scanErr = rows.Scan(
+				&r.sha256, &r.sha1, &r.md5, &r.crc32,
+				&r.fileName, &r.fileSize, &r.path,
+			)
+		}
+		if scanErr != nil {
 			continue
 		}
 		out <- r
 	}
 	return rows.Err()
+}
+
+// tableExists reports whether the named table is present in the SQLite DB.
+func tableExists(db *sql.DB, name string) bool {
+	var count int
+	db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name,
+	).Scan(&count)
+	return count > 0
 }
 
 // ── Serialisation worker ──────────────────────────────────────────────────────
