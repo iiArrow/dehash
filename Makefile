@@ -11,6 +11,7 @@ build: tidy
 	go build -ldflags="-s -w" -o bin/server ./cmd/server
 	go build -ldflags="-s -w" -o bin/stress ./cmd/stress
 	go build -ldflags="-s -w" -o bin/blitz  ./cmd/blitz
+	go build -ldflags="-s -w" -o bin/tui    ./cmd/tui
 
 # Import an NSRL SQLite DB into Pebble.
 # Usage: make import DB=/path/to/NSRLFile.db
