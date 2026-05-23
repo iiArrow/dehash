@@ -21,25 +21,35 @@ import (
 	"dehash/internal/store"
 )
 
-// ── tuning constants ──────────────────────────────────────────────────────────
+// ── tuning ────────────────────────────────────────────────────────────────────
 const (
-	rowChannelBuffer = 20_000 // rows buffered between SQLite reader and workers
-	kvChannelBuffer  = 10_000 // kv batches buffered between workers and Pebble writer
+	rowChannelBuffer = 20_000
+	kvChannelBuffer  = 10_000
 	commitEvery      = 500_000
 )
 
-// ── data types flowing through the pipeline ───────────────────────────────────
+// ── schema variants ───────────────────────────────────────────────────────────
+// Modern schema  : main table = METADATA, relational package data
+// Minimal schema : main table = FILE,     flat PKG/MFG/OS tables
+type schemaKind int
 
+const (
+	schemaNone    schemaKind = iota
+	schemaModern             // METADATA + PACKAGE_OBJECT + APPLICATION + ...
+	schemaMinimal            // FILE + PKG + MFG + OS
+)
+
+// ── pipeline types ────────────────────────────────────────────────────────────
 type rawRow struct {
 	sha256, sha1, md5, crc32 string
 	fileName                 string
 	fileSize                 int64
-	path                     string
+	path                     string // empty in minimal (FILE has no path column)
 	packageID                int64
 }
 
 type pkgInfo struct {
-	appName, appVersion, appType string
+	appName, appVersion, appType         string
 	manufacturer, osName, osVersion, language string
 }
 
@@ -64,36 +74,27 @@ func main() {
 	}
 	defer sqlDB.Close()
 	sqlDB.SetMaxOpenConns(1)
-
 	applyPragmas(sqlDB)
 
-	// ── detect schema variant ─────────────────────────────────────────────────
-	// The NSRL ships in two flavours:
-	//   • modern / modern-delta  — full relational schema (PACKAGE_OBJECT, APPLICATION, …)
-	//   • minimal / minimal-delta — hashes + file info only, no package metadata tables
-	fullSchema := tableExists(sqlDB, "PACKAGE_OBJECT")
-	if fullSchema {
-		log.Println("Schema: full (modern) — package details will be included")
-	} else {
-		log.Println("Schema: minimal — hash + file info only (no app/manufacturer/OS data)")
+	// ── detect schema ─────────────────────────────────────────────────────────
+	schema := detectSchema(sqlDB)
+	switch schema {
+	case schemaModern:
+		log.Println("Schema detected: modern  (METADATA + relational package tables)")
+	case schemaMinimal:
+		log.Println("Schema detected: minimal (FILE + flat PKG/MFG/OS tables)")
 	}
 
-	// ── Phase 1: preload package map into RAM (full schema only) ──────────────
-	var pkgMap map[int64]*pkgInfo
+	// ── Phase 1: load package map into RAM ────────────────────────────────────
+	log.Println("Phase 1: loading package details into memory...")
 	start := time.Now()
-	if fullSchema {
-		log.Println("Phase 1: loading package details into memory...")
-		pkgMap, err = loadPackageMap(sqlDB)
-		if err != nil {
-			log.Fatalf("load package map: %v", err)
-		}
-		log.Printf("  %d packages loaded in %s", len(pkgMap), time.Since(start).Round(time.Millisecond))
-	} else {
-		log.Println("Phase 1: skipped (minimal schema has no package tables)")
-		pkgMap = make(map[int64]*pkgInfo)
+	pkgMap, err := loadPackageMap(sqlDB, schema)
+	if err != nil {
+		log.Fatalf("load package map: %v", err)
 	}
+	log.Printf("  %d packages loaded in %s", len(pkgMap), time.Since(start).Round(time.Millisecond))
 
-	// ── Open Pebble with write-optimised settings ─────────────────────────────
+	// ── Open Pebble ───────────────────────────────────────────────────────────
 	log.Printf("Opening Pebble: %s", *pebblePath)
 	pb, err := openPebble(*pebblePath)
 	if err != nil {
@@ -101,22 +102,20 @@ func main() {
 	}
 	defer pb.Close()
 
-	// ── Phase 2: stream METADATA through parallel pipeline ────────────────────
-	log.Printf("Phase 2: streaming METADATA with %d workers...", *workers)
+	// ── Phase 2: stream rows through parallel pipeline ────────────────────────
+	log.Printf("Phase 2: streaming rows with %d workers...", *workers)
 	start = time.Now()
 
 	rowCh := make(chan rawRow, rowChannelBuffer)
 	kvCh  := make(chan []kvPair, kvChannelBuffer)
 
-	// Producer: single goroutine reads from SQLite
 	go func() {
 		defer close(rowCh)
-		if err := streamRows(sqlDB, rowCh, fullSchema); err != nil {
+		if err := streamRows(sqlDB, schema, rowCh); err != nil {
 			log.Printf("stream error: %v", err)
 		}
 	}()
 
-	// Workers: parallel msgpack serialisation
 	var wg sync.WaitGroup
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
@@ -129,12 +128,8 @@ func main() {
 			}
 		}()
 	}
-	go func() {
-		wg.Wait()
-		close(kvCh)
-	}()
+	go func() { wg.Wait(); close(kvCh) }()
 
-	// Consumer: single goroutine owns the Pebble batch
 	count, skipped := writeToPebble(pb, kvCh)
 
 	elapsed := time.Since(start)
@@ -146,9 +141,42 @@ func main() {
 	fmt.Printf("  Pebble DB path   : %s\n", *pebblePath)
 }
 
+// ── schema detection ──────────────────────────────────────────────────────────
+
+func detectSchema(db *sql.DB) schemaKind {
+	switch {
+	case tableExists(db, "METADATA"):
+		return schemaModern
+	case tableExists(db, "FILE"):
+		return schemaMinimal
+	default:
+		// List tables to help diagnose unknown schemas.
+		rows, _ := db.Query(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
+		var tables []string
+		if rows != nil {
+			for rows.Next() {
+				var t string
+				rows.Scan(&t)
+				tables = append(tables, t)
+			}
+			rows.Close()
+		}
+		log.Fatalf("unrecognized NSRL schema — found tables: %v\n"+
+			"  Expected: METADATA (modern) or FILE (minimal)", tables)
+		return schemaNone
+	}
+}
+
+func tableExists(db *sql.DB, name string) bool {
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n)
+	return n > 0
+}
+
 // ── Phase 1: package map ──────────────────────────────────────────────────────
 
-const pkgQuery = `
+// Modern: join across the full relational schema.
+const pkgQueryModern = `
 SELECT
     po.package_id,
     COALESCE(a.name, ''),
@@ -193,8 +221,30 @@ LEFT JOIN (
 GROUP BY po.package_id
 `
 
-func loadPackageMap(db *sql.DB) (map[int64]*pkgInfo, error) {
-	rows, err := db.Query(pkgQuery)
+// Minimal: PKG is already flat, just join MFG and OS for names.
+const pkgQueryMinimal = `
+SELECT
+    p.package_id,
+    COALESCE(p.name,             ''),
+    COALESCE(p.version,          ''),
+    COALESCE(p.application_type, ''),
+    COALESCE(m.name,             ''),
+    COALESCE(o.name,             ''),
+    COALESCE(o.version,          ''),
+    COALESCE(p.language,         '')
+FROM PKG p
+LEFT JOIN MFG m ON p.manufacturer_id  = m.manufacturer_id
+LEFT JOIN OS  o ON p.operating_system_id = o.operating_system_id
+GROUP BY p.package_id
+`
+
+func loadPackageMap(db *sql.DB, schema schemaKind) (map[int64]*pkgInfo, error) {
+	query := pkgQueryModern
+	if schema == schemaMinimal {
+		query = pkgQueryMinimal
+	}
+
+	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -204,8 +254,10 @@ func loadPackageMap(db *sql.DB) (map[int64]*pkgInfo, error) {
 	for rows.Next() {
 		var id int64
 		p := &pkgInfo{}
-		if err := rows.Scan(&id, &p.appName, &p.appVersion, &p.appType,
-			&p.manufacturer, &p.osName, &p.osVersion, &p.language); err != nil {
+		if err := rows.Scan(&id,
+			&p.appName, &p.appVersion, &p.appType,
+			&p.manufacturer, &p.osName, &p.osVersion, &p.language,
+		); err != nil {
 			continue
 		}
 		m[id] = p
@@ -213,10 +265,10 @@ func loadPackageMap(db *sql.DB) (map[int64]*pkgInfo, error) {
 	return m, rows.Err()
 }
 
-// ── Phase 2: stream METADATA rows ────────────────────────────────────────────
+// ── Phase 2: stream rows ──────────────────────────────────────────────────────
 
-// Full schema: join PACKAGE_OBJECT to get package_id for detail lookup.
-const metaQueryFull = `
+// Modern: METADATA joined to PACKAGE_OBJECT for package_id.
+const metaQueryModern = `
 SELECT
     md.sha256,
     md.sha1,
@@ -233,25 +285,22 @@ FROM METADATA md
 LEFT JOIN PACKAGE_OBJECT po ON md.object_id = po.object_id
 `
 
-// Minimal schema: no PACKAGE_OBJECT — read hashes and file info only.
+// Minimal: FILE is already flat with package_id, file_name includes extension.
 const metaQueryMinimal = `
 SELECT
     sha256,
     sha1,
     md5,
     crc32,
-    CASE WHEN extension = '' OR extension IS NULL
-         THEN file_name
-         ELSE file_name || '.' || extension
-    END,
-    bytes,
-    COALESCE(path, '')
-FROM METADATA
+    file_name,
+    file_size,
+    package_id
+FROM FILE
 `
 
-func streamRows(db *sql.DB, out chan<- rawRow, fullSchema bool) error {
-	query := metaQueryFull
-	if !fullSchema {
+func streamRows(db *sql.DB, schema schemaKind, out chan<- rawRow) error {
+	query := metaQueryModern
+	if schema == schemaMinimal {
 		query = metaQueryMinimal
 	}
 
@@ -264,15 +313,16 @@ func streamRows(db *sql.DB, out chan<- rawRow, fullSchema bool) error {
 	for rows.Next() {
 		var r rawRow
 		var scanErr error
-		if fullSchema {
+		if schema == schemaMinimal {
+			// FILE has no path column — leave r.path as ""
 			scanErr = rows.Scan(
 				&r.sha256, &r.sha1, &r.md5, &r.crc32,
-				&r.fileName, &r.fileSize, &r.path, &r.packageID,
+				&r.fileName, &r.fileSize, &r.packageID,
 			)
 		} else {
 			scanErr = rows.Scan(
 				&r.sha256, &r.sha1, &r.md5, &r.crc32,
-				&r.fileName, &r.fileSize, &r.path,
+				&r.fileName, &r.fileSize, &r.path, &r.packageID,
 			)
 		}
 		if scanErr != nil {
@@ -283,16 +333,7 @@ func streamRows(db *sql.DB, out chan<- rawRow, fullSchema bool) error {
 	return rows.Err()
 }
 
-// tableExists reports whether the named table is present in the SQLite DB.
-func tableExists(db *sql.DB, name string) bool {
-	var count int
-	db.QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name,
-	).Scan(&count)
-	return count > 0
-}
-
-// ── Serialisation worker ──────────────────────────────────────────────────────
+// ── serialisation worker ──────────────────────────────────────────────────────
 
 func serializeRow(r rawRow, pkgMap map[int64]*pkgInfo) []kvPair {
 	d := model.FileDetails{
@@ -304,7 +345,7 @@ func serializeRow(r rawRow, pkgMap map[int64]*pkgInfo) []kvPair {
 		FileSize: r.fileSize,
 		Path:     r.path,
 	}
-	if p, ok := pkgMap[r.packageID]; ok && p != nil {
+	if p := pkgMap[r.packageID]; p != nil {
 		d.AppName      = p.appName
 		d.AppVersion   = p.appVersion
 		d.AppType      = p.appType
@@ -325,9 +366,9 @@ func serializeRow(r rawRow, pkgMap map[int64]*pkgInfo) []kvPair {
 		hexStr string
 	}{
 		{store.PrefixSHA256, r.sha256},
-		{store.PrefixSHA1, r.sha1},
-		{store.PrefixMD5, r.md5},
-		{store.PrefixCRC32, r.crc32},
+		{store.PrefixSHA1,   r.sha1},
+		{store.PrefixMD5,    r.md5},
+		{store.PrefixCRC32,  r.crc32},
 	} {
 		if h.hexStr == "" {
 			continue
@@ -351,7 +392,6 @@ func writeToPebble(pb *pebble.DB, kvCh <-chan []kvPair) (count, skipped int64) {
 	var ops atomic.Int64
 	start := time.Now()
 
-	// Progress ticker
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	done := make(chan struct{})
@@ -360,8 +400,7 @@ func writeToPebble(pb *pebble.DB, kvCh <-chan []kvPair) (count, skipped int64) {
 			select {
 			case <-ticker.C:
 				n := ops.Load()
-				elapsed := time.Since(start).Seconds()
-				fmt.Printf("\r  %d records | %.0f rec/s    ", n, float64(n)/elapsed)
+				fmt.Printf("\r  %d records | %.0f rec/s    ", n, float64(n)/time.Since(start).Seconds())
 			case <-done:
 				return
 			}
@@ -398,9 +437,9 @@ func writeToPebble(pb *pebble.DB, kvCh <-chan []kvPair) (count, skipped int64) {
 func applyPragmas(db *sql.DB) {
 	for _, p := range []string{
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA cache_size=-2097152",    // 2 GB page cache
+		"PRAGMA cache_size=-2097152",
 		"PRAGMA temp_store=MEMORY",
-		"PRAGMA mmap_size=17179869184",  // 16 GB mmap
+		"PRAGMA mmap_size=17179869184",
 		"PRAGMA synchronous=OFF",
 		"PRAGMA query_only=ON",
 		"PRAGMA threads=4",
@@ -413,15 +452,11 @@ func applyPragmas(db *sql.DB) {
 
 func openPebble(path string) (*pebble.DB, error) {
 	opts := &pebble.Options{
-		// Large write buffer — reduces compaction pressure during bulk import.
 		MemTableSize:                256 << 20,
 		MemTableStopWritesThreshold: 8,
-		// Skip WAL — ETL is idempotent; crash = re-run.
-		DisableWAL: true,
-		// Allow aggressive background compaction while writing.
-		MaxConcurrentCompactions: func() int { return runtime.NumCPU() / 2 },
-		// 512 MB block cache for hot blocks.
-		Cache: pebble.NewCache(512 << 20),
+		DisableWAL:                  true,
+		MaxConcurrentCompactions:    func() int { return runtime.NumCPU() / 2 },
+		Cache:                       pebble.NewCache(512 << 20),
 		Levels: []pebble.LevelOptions{
 			{
 				BlockSize:    32 * 1024,
