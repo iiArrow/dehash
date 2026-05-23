@@ -425,7 +425,7 @@ func writeToPebble(pb *pebble.DB, kvCh <-chan []kvPair) (count, skipped int64) {
 		}
 	}
 
-	if err := batch.Commit(pebble.Sync); err != nil {
+	if err := batch.Commit(pebble.NoSync); err != nil {
 		log.Fatalf("final commit: %v", err)
 	}
 	close(done)

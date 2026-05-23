@@ -47,7 +47,13 @@ echo "  NSRL Hash Lookup Service"
 echo ""
 
 # ── build binaries if missing ────────────────────────────────────────────────
-if [[ ! -f bin/etl || ! -f bin/server ]]; then
+_need_build=false
+[[ ! -f bin/etl || ! -f bin/server ]] && _need_build=true
+# Rebuild if any Go source is newer than the compiled binaries.
+if ! $_need_build && find . -name '*.go' -newer bin/etl -print -quit 2>/dev/null | grep -q .; then
+    _need_build=true
+fi
+if $_need_build; then
     banner "Building binaries"
     command -v go &>/dev/null || die "Go is not installed. Get it from https://go.dev/dl/"
     mkdir -p bin

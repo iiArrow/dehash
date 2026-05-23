@@ -1,19 +1,40 @@
 -- wrk script: bulk hash lookup
--- Usage: wrk -t4 -c20 -d30s -s wrk/bulk.lua http://localhost:8080/bulk
+-- Usage: wrk -t4 -c20 -d30s -s wrk/bulk.lua http://localhost:8080/bulk \
+--          -- --hashfile hashes.txt [--batchsize 100] [--details true]
 --
 -- Builds a fresh random batch on every request.
--- Adjust BATCH_SIZE and DETAILS as needed.
 
-local HASH_FILE  = "hashes_amcache.txt"
-local BATCH_SIZE = 100     -- hashes per request
-local DETAILS    = "false" -- "true" to benchmark with full details
+local hashes     = {}
+local BATCH_SIZE = 100
+local DETAILS    = "false"
 
-local hashes = {}
+local function parse_args(args)
+    local flags = {}
+    local i = 1
+    while i <= #args do
+        local key = args[i]:match("^%-%-(.+)$")
+        if key and args[i+1] then
+            flags[key] = args[i+1]
+            i = i + 2
+        else
+            i = i + 1
+        end
+    end
+    return flags
+end
 
 function init(args)
-    local f = io.open(HASH_FILE, "r")
+    local flags = parse_args(args)
+
+    if not flags["hashfile"] then
+        error("usage: wrk ... -- --hashfile <path> [--batchsize 100] [--details true|false]")
+    end
+    BATCH_SIZE = tonumber(flags["batchsize"]) or 100
+    DETAILS    = flags["details"] or "false"
+
+    local f = io.open(flags["hashfile"], "r")
     if not f then
-        error("cannot open " .. HASH_FILE)
+        error("cannot open " .. flags["hashfile"])
     end
     for line in f:lines() do
         local h = line:match("^%s*(.-)%s*$")
@@ -23,8 +44,8 @@ function init(args)
     end
     f:close()
     math.randomseed(os.time())
-    print(string.format("[bulk.lua] loaded %d hashes, batch=%d, details=%s",
-        #hashes, BATCH_SIZE, DETAILS))
+    print(string.format("[bulk.lua] loaded %d hashes from %s, batch=%d, details=%s",
+        #hashes, flags["hashfile"], BATCH_SIZE, DETAILS))
 end
 
 function request()
