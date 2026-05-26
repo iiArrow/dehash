@@ -1,6 +1,6 @@
 # dehash
 
-Fast NSRL hash lookup service for SOC analysts. Check file hashes against the [NIST National Software Reference Library (NSRL)](https://www.nist.gov/itl/ssd/software-quality-group/national-software-reference-library-nsrl) to identify known-good files and surface suspicious ones.
+Fast NSRL hash lookup service for Blue Teamers! Check file hashes against the [NIST National Software Reference Library (NSRL)](https://www.nist.gov/itl/ssd/software-quality-group/national-software-reference-library-nsrl) to identify known-good files and surface suspicious ones.
 
 ---
 
@@ -24,7 +24,7 @@ Supports **SHA256**, **SHA1**, **MD5**, and **CRC32** — auto-detected by hash 
 │  ETL (one-time, run after each NSRL release)                    │
 │                                                                 │
 │  NSRL SQLite DB  ──►  Go ETL pipeline  ──►  Pebble (embedded)  │
-│  (142 GB)              two-phase:             lookup store      │
+│           )              two-phase:             lookup store      │
 │                         1. load package map   ~40–60 GB         │
 │                         2. stream METADATA                      │
 └─────────────────────────────────────────────────────────────────┘
@@ -316,8 +316,40 @@ go run examples/client/main.go
 go run examples/client/main.go --hash 34b2d30ced220c984e53868c46cc638b690617e4 --details
 
 # Check a whole file
-go run examples/client/main.go --file hashes_amcache.txt
+go run examples/client/main.go --file hashes.txt
 ```
+
+---
+
+## Terminal UI (TUI)
+
+An interactive terminal client built with [Bubble Tea](https://github.com/charmbracelet/bubbletea). Lets you query the server without writing any code — supports all three request types with a live results viewer.
+
+```bash
+# Build
+make build
+
+# Run
+./bin/tui
+```
+
+**Features:**
+- Configure server URL and port from the UI
+- Switch between `lookup`, `bulk`, and `file` modes
+- Built-in file picker for selecting hash list files
+- Toggle `details` on/off
+- Syntax-highlighted JSON output with a scrollable viewport
+- Saves last response to a file
+
+**Keyboard shortcuts:**
+
+| Key | Action |
+|---|---|
+| `Tab` / `↑↓` | Navigate fields |
+| `←` `→` | Change radio options (request type, details) |
+| `Space` | Toggle / open file picker |
+| `Enter` | Send request |
+| `Ctrl+C` | Quit |
 
 ---
 
@@ -358,6 +390,7 @@ dehash/
 ├── cmd/
 │   ├── etl/        — NSRL SQLite → Pebble import pipeline
 │   ├── server/     — HTTP API server
+│   ├── tui/        — Bubble Tea interactive terminal client
 │   ├── stress/     — structured stress test (4 scenarios + percentiles)
 │   └── blitz/      — max-throughput blitz test (live counter + sparkline)
 ├── internal/
